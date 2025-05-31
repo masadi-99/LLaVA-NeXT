@@ -1140,13 +1140,15 @@ class LazySupervisedDataset(Dataset):
         if "image" in sources[0]:
             image_file = self.list_data_dict[i]["image"]
             if type(image_file) is list:
-                image = [self.process_image(f) for f in image_file]
-                # Handling multi images
-                # overwrite to process with simple pad 
                 if len(image_file) > 1:
+                    # Multiple images - use pad mode for consistency
                     image = [self.process_image(f, "pad") for f in image_file]
                     image = [[im[0], im[1], "image"] for im in image]
+                else:
+                    # Single image in a list - use default processing
+                    image = [self.process_image(image_file[0])]
             else:
+                # Single image (not in list)
                 image = [self.process_image(image_file)]
             sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
 
@@ -1225,11 +1227,8 @@ class LazySupervisedDataset(Dataset):
         elif "video" in self.list_data_dict[i]:
             data_dict["image"] = image
         elif self.data_args.is_multimodal:
-            # image does not exist in the data, but the model is multimodal
-            crop_size = self.data_args.image_processor.crop_size
-            data_dict["image"] = [
-                (torch.zeros(1, 3, crop_size["height"], crop_size["width"]), (crop_size["width"], crop_size["height"]), "text"),
-            ]
+            # Error: multimodal model requires image or video data
+            raise ValueError(f"Sample {i} (id: {self.list_data_dict[i].get('id', 'unknown')}) is missing 'image' or 'video' field, but model is configured as multimodal. Please provide visual data or use a text-only model.")
         # prompt exist in the data
         if prompt is not None:
             data_dict["prompt"] = prompt
