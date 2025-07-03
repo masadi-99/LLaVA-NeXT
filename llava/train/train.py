@@ -1150,7 +1150,11 @@ class LazySupervisedDataset(Dataset):
             else:
                 # Single image (not in list)
                 image = [self.process_image(image_file)]
+            if not DEFAULT_IMAGE_TOKEN in sources[0]["conversations"][0]["value"]:
+                sources[0]["conversations"][0]["value"] = DEFAULT_IMAGE_TOKEN+sources[0]["conversations"][0]["value"]
             sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
+            sources[0]["conversations"][0]["value"] = sources[0]["conversations"][0]["value"].replace(DEFAULT_IMAGE_TOKEN, "".join([DEFAULT_IMAGE_TOKEN for _ in range(len(image))]))
+
 
         elif "video" in sources[0]:
             video_file = self.list_data_dict[i]["video"]
