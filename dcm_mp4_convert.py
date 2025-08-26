@@ -28,7 +28,7 @@ import json
 TEMP_BASE_DIR = "/raid/projects/masadi/echo_temp"
 
 # Output base directory where converted studies will be stored
-OUTPUT_BASE_DIR = "/raid/projects/masadi/echo_extracted"
+OUTPUT_BASE_DIR = "/home/masadi/cmr_demo/cmr_extracted"
 
 # Whether to keep intermediate files for debugging
 DEBUG_KEEP_TEMP = False
@@ -99,7 +99,96 @@ class DicomStudyProcessor:
             'unique_metadata_keys': set(),
             'errors': []
         }
-    
+
+    # ===================== NEW HELPERS FOR JSON-SERIALIZABLE METADATA =====================
+
+    def _tag_name(self, elem):
+        """
+        Prefer DICOM keyword; fall back to (gggg,eeee) tag.
+        """
+        try:
+            if elem.keyword and elem.keyword != '':
+                return elem.keyword
+        except Exception:
+            pass
+        try:
+            return f"({int(elem.tag.group):04X},{int(elem.tag.element):04X})"
+        except Exception:
+            return str(getattr(elem, "tag", "UNKNOWN_TAG"))
+
+    def _element_to_primitive(self, elem):
+        """
+        Convert a pydicom DataElement to JSON-serializable primitive(s).
+        Handles sequences (SQ), nested Datasets, MultiValue, PersonName, numbers, numpy, bytes, etc.
+        """
+        value = elem.value
+        return self._to_primitive(value)
+
+    def _to_primitive(self, value):
+        """
+        Convert arbitrary pydicom values into JSON-serializable primitives:
+        dict/list/str/float/int/bool/None. Nested Datasets and Sequences become dicts/lists.
+        """
+        import pydicom
+        from pydicom.multival import MultiValue
+        from pydicom.valuerep import PersonName, PersonNameBase, DSfloat, DSdecimal, IS
+
+        # Dataset -> dict of elements
+        if isinstance(value, pydicom.dataset.Dataset):
+            out = {}
+            for sub in value:
+                if sub.keyword == 'PixelData':
+                    continue
+                key = self._tag_name(sub)
+                out[key] = self._element_to_primitive(sub)
+            return out
+
+        # Sequence (list of Datasets)
+        if isinstance(value, list) and all(isinstance(v, pydicom.dataset.Dataset) for v in value):
+            return [self._to_primitive(v) for v in value]
+
+        # MultiValue -> list
+        if isinstance(value, MultiValue):
+            return [self._to_primitive(v) for v in value]
+
+        # Known wrapper types -> native types / strings
+        if isinstance(value, (PersonName, PersonNameBase)):
+            return str(value)
+        if isinstance(value, (DSfloat, DSdecimal)):
+            try:
+                return float(value)
+            except Exception:
+                return str(value)
+        if isinstance(value, IS):
+            try:
+                return int(value)
+            except Exception:
+                # sometimes IS wraps non-int text; fall back to string
+                return str(value)
+
+        # bytes -> try decode; else length descriptor
+        if isinstance(value, (bytes, bytearray)):
+            try:
+                return value.decode('utf-8')
+            except Exception:
+                return f"<{len(value)} bytes>"
+
+        # numpy scalars/arrays -> python scalars / lists
+        try:
+            import numpy as np
+            if isinstance(value, np.generic):
+                return value.item()
+            if isinstance(value, np.ndarray):
+                # Avoid blowing up CSV with giant arrays except sequences; but still serialize
+                return value.tolist()
+        except Exception:
+            pass
+
+        # Everything else: int/float/str/bool/None
+        return value
+
+    # =======================================================================================
+
     def _setup_directories(self):
         """Setup temporary and output directories"""
         # Create temporary directory
@@ -300,32 +389,24 @@ class DicomStudyProcessor:
             metadata['dicom_filename'] = dicom_path.name
             metadata['dicom_path_relative'] = str(dicom_path.relative_to(self.temp_dir))
             
-            # Extract all DICOM metadata
+            # Extract all DICOM metadata with JSON-safe serialization
             for elem in ds:
                 if elem.keyword == 'PixelData':
                     continue  # Skip pixel data
-                
+                key = self._tag_name(elem)
                 try:
-                    # Handle different data types
-                    if elem.VR == 'SQ':  # Sequence
-                        # For sequences, store as JSON string
-                        metadata[elem.keyword] = f"SEQUENCE[{len(elem.value)} items]"
-                    elif hasattr(elem.value, '__len__') and not isinstance(elem.value, str):
-                        # For arrays/lists, convert to string
-                        if len(elem.value) == 1:
-                            metadata[elem.keyword] = elem.value[0]
-                        else:
-                            metadata[elem.keyword] = str(list(elem.value))
+                    value = self._element_to_primitive(elem)
+                    # Store as JSON strings when dict/list, otherwise raw value
+                    if isinstance(value, (dict, list)):
+                        metadata[key] = json.dumps(value, ensure_ascii=False, default=str)
                     else:
-                        metadata[elem.keyword] = elem.value
-                    
+                        metadata[key] = value
                     # Track unique keys
-                    self.stats['unique_metadata_keys'].add(elem.keyword)
-                    
-                except Exception as e:
-                    # If we can't process the metadata, store as string
-                    metadata[elem.keyword] = str(elem.value)
-                    self.stats['unique_metadata_keys'].add(elem.keyword)
+                    self.stats['unique_metadata_keys'].add(key)
+                except Exception:
+                    # Fallback to string
+                    metadata[key] = str(elem.value)
+                    self.stats['unique_metadata_keys'].add(key)
             
             # Extract and save pixel data if available
             frames_saved = 0
@@ -402,8 +483,14 @@ class DicomStudyProcessor:
             # Convert to DataFrame
             df = pd.DataFrame(self.metadata_list)
             
+            # Ensure any remaining dict/list values are JSON-encoded
+            for col in df.columns:
+                if df[col].map(lambda v: isinstance(v, (dict, list))).any():
+                    df[col] = df[col].apply(lambda v: json.dumps(v, ensure_ascii=False, default=str) if isinstance(v, (dict, list)) else v)
+
             # Sort by dicom_index
-            df = df.sort_values('dicom_index')
+            if 'dicom_index' in df.columns:
+                df = df.sort_values('dicom_index')
             
             # Save to CSV
             df.to_csv(csv_path, index=False)
@@ -680,15 +767,6 @@ class DicomStudyProcessor:
         except Exception as e:
             print(f"⚠️  Warning: Could not write to failed_studies.txt: {e}")
     
-    def _cleanup_failed_study(self):
-        """Clean up partial output for failed studies"""
-        try:
-            if self.output_dir and self.output_dir.exists():
-                print(f"🧹 Cleaning up failed study output: {self.output_dir}")
-                shutil.rmtree(self.output_dir)
-        except Exception as e:
-            print(f"⚠️  Warning: Could not clean failed study output: {e}")
-    
     def process(self):
         """Main processing pipeline"""
         start_time = datetime.now()
@@ -810,7 +888,7 @@ def main():
             print(f"   MP4 codecs (in order): {', '.join(MP4_CODECS)}")
             print(f"   Delete JPGs after MP4: {DELETE_JPGS_AFTER_MP4}")
         print("\nOutput files per study:")
-        print("   • study_metadata.csv - All DICOM metadata")
+        print("   • study_metadata.csv - All DICOM metadata (sequences serialized as JSON)")
         if CREATE_MP4_FOR_MULTIFRAME:
             print("   • images/dicom_XXXX/dicom_XXXX.mp4 - Multi-frame videos")
             print("   • images/dicom_XXXX/frame_000.jpg - Single frames (or remaining JPGs)")
@@ -853,4 +931,27 @@ if __name__ == '__main__':
 # Example usage with GNU parallel:
 # find /path/to/studies -name "*.tgz" | parallel -j 4 python dicom_to_csv_jpg.py {}
 #
-
+# Loading the data back:
+# import pandas as pd
+# from PIL import Image
+# import numpy as np
+# import cv2
+# 
+# # Load metadata
+# df = pd.read_csv('study_metadata.csv')
+# 
+# # Parse a JSON sequence column (example)
+# # import json; df['PerFrameFunctionalGroupsSequence'] = df['PerFrameFunctionalGroupsSequence'].apply(json.loads)
+# 
+# # Load a specific JPG image (RGB or grayscale)
+# img = Image.open('images/dicom_0000/frame_000.jpg')
+# img_array = np.array(img)  # (H, W, 3) for RGB or (H, W) for grayscale
+#
+# # Load MP4 video (if created)
+# cap = cv2.VideoCapture('images/dicom_0001/dicom_0001.mp4')
+# while True:
+#     ret, frame = cap.read()
+#     if not ret:
+#         break
+#     # Process frame...
+# cap.release()
