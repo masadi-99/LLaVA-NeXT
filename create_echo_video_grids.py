@@ -214,7 +214,7 @@ def _opencv_letterbox(frame, size):
 def _try_open_writer_mp4(cv2, path_str, fps, wh):
     """
     Try a few MP4/H.264 fourccs. Return (writer, fourcc_used) or (None, None).
-    Try codecs in order of preference, silently handling failures.
+    Try codecs in order of preference. (Unmuted for reproducibility.)
     """
     # Try different fourcc codes in order of preference
     codecs_to_try = [
