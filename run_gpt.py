@@ -288,7 +288,7 @@ if __name__ == "__main__":
     print()
 
     with open(data_path, 'r') as f:
-        multimodal_test = json.load(f).copy()
+        multimodal_test = json.load(f).copy()[:100]
 
     # MMC_total_correct = 0
     model_total_correct = 0
